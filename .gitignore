@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files
+*.xlsx
+*.csv
+
+# Config (may contain RPC URLs / API keys)
+exploit_config.json
+erc4626_batch_config.json
+
+# OS
+.DS_Store
+Thumbs.db
