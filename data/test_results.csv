@@ -1,0 +1,2 @@
+suspicious_contract,block_number,vault,asset_address,is_verified,min_block,max_profit_usdc,test_status,notes
+0xf4a6113fbd71ac1825751a6fe844a156f60c83ef,22497642,0xdfA525BD3A8e59d336EF725309F855250538c337,0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E,,22497642,,SEARCHED,迭代18次

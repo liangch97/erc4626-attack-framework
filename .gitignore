@@ -3,13 +3,15 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Data files
+# Data files (root level xlsx only)
 *.xlsx
-*.csv
 
 # Config (may contain RPC URLs / API keys)
 exploit_config.json
 erc4626_batch_config.json
+
+# Output logs (regeneratable)
+output/
 
 # OS
 .DS_Store

