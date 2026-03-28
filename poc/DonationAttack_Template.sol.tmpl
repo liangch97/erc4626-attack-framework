@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.15;
+
+// ===========================================================================
+// ERC4626 Donation Attack - Universal Flash Loan PoC Template
+//
+// 策略:
+//   1. Aave V3 Flash Loan USDC (总是可用)
+//   2. 在回调中用 deal() 模拟 DEX swap USDC → vault asset
+//      (真实攻击中会通过 Uniswap/Curve 等 DEX 完成)
+//   3. 执行 donation attack: deposit(1 wei) → donate → victim deposits → redeem
+//   4. swap asset → USDC (deal 模拟), 偿还 flash loan
+//   5. 计算净利润 (扣除 Aave 0.05% 手续费 + DEX swap 成本估算)
+//
+// 为什么用 deal 模拟 DEX swap?
+//   - 很多 vault 的底层资产 (deUSD, USDL, USDM...) 不在 Aave 上
+//   - 但在真实场景中, 攻击者可以 flash loan USDC 再通过 DEX 换成目标 token
+//   - deal 模拟的是 swap 的结果, 不影响攻击经济性分析的正确性
+//   - 关键差异: 旧版 deal 给攻击者免费资金; 新版计算偿还成本和净利润
+// ===========================================================================
+
+import "../basetest.sol";
+import {IERC20} from "../interface.sol";
+
+interface IERC4626Vault is IERC20 {
+    function asset() external view returns (address);
+    function totalAssets() external view returns (uint256);
+    function convertToShares(uint256 assets) external view returns (uint256);
+    function convertToAssets(uint256 shares) external view returns (uint256);
+    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+}
+
+interface IAaveV3Pool {
+    function flashLoanSimple(
+        address receiverAddress, address asset, uint256 amount,
+        bytes calldata params, uint16 referralCode
+    ) external;
+    function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
+}

@@ -1,8 +1,10 @@
 # ERC-4626 Vault Donation 攻击敏感性实验报告
 
-**实验日期**：2026-03-15
-**实验人员**：安全研究团队
-**报告版本**：v1.0
+**实验日期**：2026-03-15  
+**实验人员**：Liang Chen (liangch97)  
+**报告版本**：v1.0 (阶段一扫描报告)
+
+> ⚠️ **v3.0 重要修正 (2026-03-28)**：本报告仅记录阶段一自动化扫描结果（donation 敏感性检测）。后续阶段四深度实验验证证明：**所有 7 个被标记为 VULNERABLE 的 vault 均不可被经济可行地利用**。Donation 敏感性 ≠ 可被攻击。详见 [Final Report v3.0](ERC4626_Donation_Attack_Final_Report.md) 和 [实验报告](ERC4626_Donation_Attack_Experiment_Report.md)。
 
 ---
 
@@ -198,7 +200,9 @@ Step 3: 验证效果
 
 ### 5.1 核心结论
 
-1. **10 个被测 vault 中，7 个（70%）存在 donation 攻击敏感性**，均采用 balance-based 会计机制；23 个（vault, platform）对中 15 个（65.2%）处于风险状态
+> ⚠️ **v3.0 修正说明**：以下结论基于阶段一自动化扫描，仅检测 donation 敏感性。后续阶段四实验证明所有 "VULNERABLE" vault 均有合约层保护机制，实际不可被经济可行地利用。
+
+1. **10 个被测 vault 中，7 个（70%）存在 donation 敏感性**（注：敏感 ≠ 可被攻击），均采用 balance-based 会计机制
 
 2. **风险最高的 vault 为 `0x9d39`（sDOLA）**，已被 Aave v3、Aave Lido、Radiant、UwuLend 四个借贷协议同时接受为抵押品，donation 漏洞在所有检测点均存在
 
@@ -222,9 +226,9 @@ Step 3: 验证效果
 
 ### 5.3 局限性
 
-1. 搜索范围限定为 50,000 区块（≈7 天），大多数 VULNERABLE vault 的真实最早攻击区块可能更早
-2. 实验仅验证 donation 有效性，未模拟完整攻击链（闪贷→捐赠→受害者存款→套利）
-3. 部分 rebasing token 的 vm.store 路径依赖 slot 猜测，极端情况下可能失效
+1. 搜索范围限定为 50,000 区块（≈7 天），大多数 VULNERABLE vault 的真实最早攻击区块可能更早 → **已在阶段二解决**
+2. ~~实验仅验证 donation 有效性，未模拟完整攻击链~~ → **已在阶段四解决，结果：全部不可利用**
+3. 部分 rebasing token 的 vm.store 路径依赖 slot 猜测，极端情况下可能失效 → **已在阶段四确认不影响结论**
 
 ---
 

